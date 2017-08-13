@@ -56,7 +56,6 @@ static uint32_t CurrAddress;
  *  via a watchdog reset. When cleared the bootloader will exit, starting the watchdog and entering an infinite
  *  loop until the AVR restarts and the application runs.
  */
-static bool RunBootloader = true;
 
 
 #define ATTINY_I2C_ADDR 0xB0
@@ -70,11 +69,11 @@ static uint8_t make_leds_black[] = {0x03,0x00,0x00,0x00};
 // static uint8_t make_leds_red[] = {UPDATE_LED_CMD,0x03,RED };
 // static uint8_t run_leds_fast[] = { 0x06, 0x05};
 
-static uint8_t progress_led = 24; // This is the LED on the "prog" key
+static uint8_t progress_led = 24; // This is the LED on the "prog" key, bitshifted by 3 bits
 
 
 /* Bootloader timeout timer */
-#define TIMEOUT_PERIOD	8000
+#define TIMEOUT_PERIOD 8000
 uint16_t Timeout = 0;
 
 uint16_t bootKey = 0x7777;
@@ -100,7 +99,7 @@ void StartSketch(void) {
 }
 
 
-void CheckReprogrammingKey(void) {
+static inline void CheckReprogrammingKey(void) {
 
     // Hold the ATTiny in reset, so it can't mess with this read
     DDRC |= _BV(6);
@@ -113,40 +112,44 @@ void CheckReprogrammingKey(void) {
     PORTF |= _BV(1); // turn on pullup
     PORTF &= ~_BV(0); // make our output low
 
-    __asm__("nop"); // Just in case we need a moment to get the read, like on the ATTiny
+    // we need a moment to get the read, or we get some real weird behavior
+    // specifically, at random intervals, we end up in the bootloader on first boot
+    // even if the prog key isn't held down.
+    //
+    // I (jesse) believe that the issue is that we were getting our reads
+    // before the ATTiny had fully get reset
+    _delay_ms(5);
     if ( PINF & _BV(1)) { // If the pin is hot
-        _delay_ms(5); // debounce
+        _delay_ms(10); // debounce
         if (PINF & _BV(1)) { // If it's still hot, no key was pressed
             // Start the sketch
-            DDRC &= ~_BV(6); // Turn the ATTiny back on
+            PORTC |= _BV(6); // Turn the ATTiny back on
             StartSketch();
         }
     }
-    _delay_ms(5);
-    DDRC &= ~_BV(6); // Turn the ATTiny back on
+    PORTC |= _BV(6); // Turn the ATTiny back on
 }
 
 
-void update_progress(void) {
-    i2c_send( ATTINY_I2C_ADDR, &make_leds_black[0], sizeof(make_leds_black));
+static inline void UpdateProgressLED(void) {
     // We bitshift the LED counter by 3 to slow it down a bit
     uint8_t led_cmd[] = { UPDATE_LED_CMD, progress_led>>3, RED };
-    if (progress_led++ >= 256) {
+    if (progress_led >= 256) {
         progress_led = 0;
     }
     i2c_send(ATTINY_I2C_ADDR, &led_cmd[0], sizeof(led_cmd));
 }
 
-void EnableLEDs(void) {
+static inline void EnableLEDs(void) {
     // Turn on power to the LED net
     DDRC |= _BV(7);
     PORTC |= _BV(7);
-
-    i2c_init();
-    update_progress();
-//    i2c_send( ATTINY_I2C_ADDR, &run_leds_fast[0], sizeof(run_leds_fast));
 }
 
+__attribute__ ((noinline)) static void TurnLEDsOff(void) {
+    i2c_send( ATTINY_I2C_ADDR, &make_leds_black[0], sizeof(make_leds_black));
+
+}
 
 
 /** Main program entry point. This routine configures the hardware required by the bootloader, then continuously
@@ -164,26 +167,40 @@ int main(void) {
     /* Watchdog may be configured with a 15 ms period so must disable it before going any further */
     wdt_disable();
 
+    i2c_init();
+
     // Set the LEDs to black, so they don't flash.
+    TurnLEDsOff();
 
 
+    /* Don't run the user application if the reset vector is blank (no app loaded) */
+    bool ApplicationValid = (pgm_read_word_near(0) != 0xFFFF);
 
-    if (((mcusr_state & (1<<PORF))  // After power on reset
-            || ((mcusr_state & (1<<WDRF)) && bootKeyPtrVal != bootKey )) // or an accidental watchdog reset
-            && (pgm_read_word(0) != 0xFFFF)) {
-        // After a power-on reset skip the bootloader and jump straight to sketch
-        // if one exists.
-        // If it looks like an "accidental" watchdog reset then start the sketch.
-        StartSketch();
-    } else if (mcusr_state & (1<<EXTRF)) {
-        // External reset -  we should continue to self-programming mode.
-    } else { // If it's not an external reset, it must be a triggered reset. So
-        // Let's make sure the user is holding down the magic key.
-        // Otherwise, it's pretty easy to blow bad firmware onto the
-        // device.
-        CheckReprogrammingKey();
-
+    if (ApplicationValid) {
+        if (((mcusr_state & (1<<WDRF)) && bootKeyPtrVal != bootKey )) {
+            // If it looks like an "accidental" watchdog reset then start the sketch.
+            StartSketch();
+        } else if (mcusr_state == _BV(EXTRF)) {
+            // External reset -  we should continue to self-programming mode.
+            // Note that we're checking that mcusr_state is set ONLY to external reset
+            // The atmega32u4 will populate EXTRF on power on as well as an explicit
+            // external reset condition
+            // If htis logic were "mcusr_state & _BV(EXTRF)", it would trigger on
+            // first boot...sometimes.
+            // That'd lead to the keyboard going into a lengthy bootloader phase
+            // when the user plugged it in
+            // We explicitly don't want to trigger this in the case of a watchdog reset,
+            // power on reset or a brownout reset.
+        } else {
+            // If it's not an external reset, it must be a triggered reset. So
+            // Let's make sure the user is holding down the magic key.
+            // Otherwise, it's pretty easy to blow malicious firmware onto the
+            // device.
+            CheckReprogrammingKey();
+        }
     }
+
+
     /* Setup hardware required for the bootloader */
     SetupHardware();
 
@@ -192,14 +209,17 @@ int main(void) {
 
     Timeout = 0;
 
-    while (RunBootloader) {
+    EnableLEDs();
+
+    /* Time out and start the sketch if one is present */
+    while (Timeout < TIMEOUT_PERIOD) {
+        UpdateProgressLED();
         CDC_Task();
         USB_USBTask();
-        /* Time out and start the sketch if one is present */
-        if (Timeout > TIMEOUT_PERIOD)
-            RunBootloader = false;
-
     }
+
+    /* Wait a short time to end all USB transactions and then disconnect */
+    _delay_us(1000);
 
     /* Disconnect from the host - USB interface will be reset later along with the AVR */
     USB_Detach();
@@ -234,7 +254,6 @@ void SetupHardware(void) {
     TIMSK1 = (1 << OCIE1A);					// enable timer 1 output compare A match interrupt
     TCCR1B = ((1 << CS11) | (1 << CS10));	// 1/64 prescaler on timer 1 input
 
-    EnableLEDs();
 
     /* Initialize USB Subsystem */
     USB_Init();
@@ -306,9 +325,9 @@ void EVENT_USB_Device_ControlRequest(void) {
 
 #if !defined(NO_BLOCK_SUPPORT)
 /** Reads or writes a block of EEPROM or FLASH memory to or from the appropriate CDC data endpoint, depending
- *  on the AVR910 protocol command issued.
+ *  on the AVR109 protocol command issued.
  *
- *  \param[in] Command  Single character AVR910 protocol command indicating what memory operation to perform
+ *  \param[in] Command  Single character AVR109 protocol command indicating what memory operation to perform
  */
 static void ReadWriteMemoryBlock(const uint8_t Command) {
     uint16_t BlockSize;
@@ -470,7 +489,7 @@ static void WriteNextResponseByte(const uint8_t Response) {
 #define STK_READ_PAGE       0x74  // 't'
 #define STK_READ_SIGN       0x75  // 'u'
 
-/** Task to read in AVR910 commands from the CDC data OUT endpoint, process them, perform the required actions
+/** Task to read in AVR109 commands from the CDC data OUT endpoint, process them, perform the required actions
  *  and send the appropriate response back to the host.
  */
 void CDC_Task(void) {
@@ -484,7 +503,9 @@ void CDC_Task(void) {
     /* Read in the bootloader command (first byte sent from host) */
     uint8_t Command = FetchNextCommandByte();
 
-    update_progress();
+    TurnLEDsOff();
+    UpdateProgressLED();
+    progress_led++;
 
     if (Command == 'E') {
         /* We nearly run out the bootloader timeout clock,
@@ -638,7 +659,6 @@ void CDC_Task(void) {
         WriteNextResponseByte('?');
     }
 
-    update_progress();
 
 
     /* Select the IN endpoint */
