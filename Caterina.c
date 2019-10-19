@@ -318,7 +318,13 @@ void EVENT_USB_Device_ControlRequest(void) {
             Endpoint_Write_Control_Stream_LE(&LineEncoding, sizeof(CDC_LineEncoding_t));
             Endpoint_ClearOUT();
         }
-
+        break;
+    case CDC_REQ_SetControlLineState:
+        if (USB_ControlRequest.bmRequestType == (REQDIR_HOSTTODEVICE | REQTYPE_CLASS | REQREC_INTERFACE))
+        {
+                Endpoint_ClearSETUP();
+                Endpoint_ClearStatusStage();
+        }
         break;
     case CDC_REQ_SetLineEncoding:
         if (USB_ControlRequest.bmRequestType == (REQDIR_HOSTTODEVICE | REQTYPE_CLASS | REQREC_INTERFACE)) {
